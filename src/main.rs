@@ -12,6 +12,8 @@ use clap::Parser;
 use cli::{Cli, Commands, ConfigCommands};
 use config::Config;
 use render::Renderer;
+use serde::Deserialize;
+use std::io::Read;
 use tracing::{error, info};
 
 #[tokio::main]
@@ -19,7 +21,12 @@ async fn main() -> Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt::init();
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+
+    // Support `ask -c` as shortcut for chat mode
+    if cli.chat && cli.command.is_none() {
+        cli.command = Some(Commands::Chat);
+    }
 
     // Handle setup command early (before config required)
     if let Some(Commands::Setup) = cli.command {
@@ -53,24 +60,23 @@ async fn main() -> Result<()> {
 
             match cli.command {
                 Some(Commands::Explain { command }) => {
-                    // Check if we have piped input
-                    let mut piped_input = String::new();
-                    if atty::isnt(atty::Stream::Stdin) {
-                        use std::io::Read;
-                        std::io::stdin().read_to_string(&mut piped_input)?;
-                    }
-
-                    let context = if !piped_input.is_empty() {
-                        Some(format!("Piped input:\n{}", piped_input))
+                    let context = read_piped_input()?;
+                    let command_text = cli::get_command_string(&command);
+                    let explain_target = if command_text.trim().is_empty() && context.is_some() {
+                        "Explain this piped input".to_string()
                     } else {
-                        None
+                        command_text
                     };
 
-                    execute_explain(&config, &cli::get_command_string(&command), context, false)
-                        .await
+                    if explain_target.trim().is_empty() {
+                        eprintln!("Error: No command provided.");
+                        eprintln!("Usage: ask explain <command>");
+                        std::process::exit(1);
+                    }
+
+                    execute_explain(&config, &explain_target, context, false).await
                 }
                 Some(Commands::Chat) => {
-                    // TODO: Implement chat mode
                     let chat = chat::ChatMode::new(config)?;
                     chat.run().await
                 }
@@ -79,8 +85,10 @@ async fn main() -> Result<()> {
                     Ok(())
                 }
                 None => {
+                    let context = read_piped_input()?;
+
                     // No subcommand provided - default to ask mode with the query
-                    if cli.query.is_empty() {
+                    if cli.query.is_empty() && context.is_none() {
                         // If no query provided, show help
                         eprintln!("Error: No query provided.");
                         eprintln!("Usage: ask <query>");
@@ -97,8 +105,18 @@ async fn main() -> Result<()> {
                     } else {
                         crate::prompt::SystemPrompt::Command
                     };
-                    execute_command(&config, mode, &cli::get_query_string(&cli.query), cli.brief, cli.copy)
-                        .await
+                    let query = if cli.query.is_empty() {
+                        if cli.explain {
+                            "Explain this piped input".to_string()
+                        } else {
+                            "Based on the piped input, suggest the best terminal command."
+                                .to_string()
+                        }
+                    } else {
+                        cli::get_query_string(&cli.query)
+                    };
+
+                    execute_command(&config, mode, &query, context, cli.brief, cli.copy).await
                 }
             }
         }
@@ -158,6 +176,7 @@ async fn execute_command(
     config: &Config,
     mode: crate::prompt::SystemPrompt,
     query: &str,
+    context: Option<String>,
     _brief: bool,
     _copy: bool,
 ) -> Result<()> {
@@ -176,8 +195,8 @@ async fn execute_command(
 
     // Format user message
     let user_message = match mode {
-        SystemPrompt::Command => SystemPrompt::format_command_query(query, None),
-        SystemPrompt::Explain => SystemPrompt::format_explain_query(query, None),
+        SystemPrompt::Command => SystemPrompt::format_command_query(query, context.as_deref()),
+        SystemPrompt::Explain => SystemPrompt::format_explain_query(query, context.as_deref()),
         SystemPrompt::Chat => query.to_string(),
     };
 
@@ -193,51 +212,22 @@ async fn execute_command(
     // Print response based on mode
     match mode {
         SystemPrompt::Command => {
-            // Extract command from response
-            let lines: Vec<&str> = response.lines().collect();
-            let mut command_found = None;
+            let suggestion = parse_command_suggestion(&response);
+            let explanation = suggestion
+                .explanation
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty());
+            let mut explanation_rendered = false;
 
-            // Look for code block or plain command
-            let mut in_code_block = false;
-            for line in &lines {
-                if line.trim_start().starts_with("```") {
-                    in_code_block = !in_code_block;
-                    continue;
-                }
-
-                if in_code_block && !line.trim().is_empty() {
-                    // Found command in code block
-                    let cmd = line.trim().trim_start_matches('$').trim();
-                    if !cmd.starts_with("#") {
-                        command_found = Some(cmd);
-                        break;
-                    }
-                }
-            }
-
-            // If no code block found, look for the first line that looks like a command
-            if command_found.is_none() {
-                for line in &lines {
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty()
-                        && !trimmed.starts_with("#")
-                        && !trimmed.starts_with("//")
-                    {
-                        command_found = Some(trimmed.trim_start_matches('$').trim());
-                        break;
-                    }
-                }
-            }
-
-            // Display command with safety check
-            if let Some(cmd) = command_found {
+            if let Some(cmd) = suggestion.command.as_deref() {
                 // Safety check
                 if crate::safety::is_dangerous_command(cmd) {
                     renderer.print_warning(&crate::safety::get_dangerous_command_warning(cmd))?;
 
                     // Ask if user wants to see the command anyway
                     if !config.behavior.show_run_prompt
-                        || !renderer.prompt_run_command("show the command")?
+                        || !renderer.prompt_confirm("Show the command anyway")?
                     {
                         // Skip printing the full response if user doesn't want to see the command
                         return Ok(());
@@ -245,21 +235,25 @@ async fn execute_command(
                 }
 
                 renderer.print_command(cmd)?;
+                if let Some(text) = explanation {
+                    renderer.render_markdown(text)?;
+                    explanation_rendered = true;
+                }
 
-                // Prompt to run the command
-                if config.behavior.show_run_prompt && renderer.prompt_run_command(cmd)? {
-                    // Execute the command
-                    renderer.print_info(&format!("Executing: {}", cmd))?;
-                    std::process::Command::new("sh")
-                        .arg("-c")
-                        .arg(cmd)
-                        .status()
-                        .context("Failed to execute command")?;
+                if suggestion.auto_execute {
+                    if is_auto_executable_command(cmd) && renderer.prompt_run_command(cmd)? {
+                        std::process::Command::new("sh")
+                            .arg("-c")
+                            .arg(cmd)
+                            .status()
+                            .context("Failed to execute command")?;
+                    }
                 }
             }
 
-            // Show the full explanation
-            renderer.render_markdown(&response)?;
+            if !explanation_rendered && suggestion.command.is_none() {
+                renderer.render_markdown(&response)?;
+            }
         }
         _ => {
             renderer.render_markdown(&response)?;
@@ -267,6 +261,165 @@ async fn execute_command(
     }
 
     Ok(())
+}
+
+fn read_piped_input() -> Result<Option<String>> {
+    if atty::isnt(atty::Stream::Stdin) {
+        let mut piped_input = String::new();
+        std::io::stdin().read_to_string(&mut piped_input)?;
+        let trimmed = piped_input.trim();
+        if !trimmed.is_empty() {
+            return Ok(Some(format!("Piped input:\n{}", trimmed)));
+        }
+    }
+    Ok(None)
+}
+
+#[derive(Debug, Deserialize)]
+struct CommandResponse {
+    command: Option<String>,
+    explanation: Option<String>,
+    #[serde(default)]
+    auto_execute: bool,
+}
+
+#[derive(Debug)]
+struct ParsedSuggestion {
+    command: Option<String>,
+    explanation: Option<String>,
+    auto_execute: bool,
+}
+
+fn parse_command_suggestion(response: &str) -> ParsedSuggestion {
+    if let Some(parsed) = parse_command_response_json(response) {
+        let command = parsed
+            .command
+            .map(|c| c.trim().trim_start_matches('$').trim().to_string())
+            .filter(|c| !c.is_empty());
+
+        return ParsedSuggestion {
+            command,
+            explanation: parsed.explanation,
+            auto_execute: parsed.auto_execute,
+        };
+    }
+
+    ParsedSuggestion {
+        command: extract_command_from_text(response),
+        explanation: None,
+        auto_execute: false,
+    }
+}
+
+fn parse_command_response_json(response: &str) -> Option<CommandResponse> {
+    if let Ok(parsed) = serde_json::from_str::<CommandResponse>(response) {
+        return Some(parsed);
+    }
+
+    let mut in_code_block = false;
+    let mut json_lines = Vec::new();
+    for line in response.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            if in_code_block {
+                let candidate = json_lines.join("\n");
+                if let Ok(parsed) = serde_json::from_str::<CommandResponse>(&candidate) {
+                    return Some(parsed);
+                }
+                json_lines.clear();
+            }
+            in_code_block = !in_code_block;
+            continue;
+        }
+
+        if in_code_block {
+            json_lines.push(line);
+        }
+    }
+
+    None
+}
+
+fn extract_command_from_text(response: &str) -> Option<String> {
+    let lines: Vec<&str> = response.lines().collect();
+    let mut in_code_block = false;
+    for line in &lines {
+        if line.trim_start().starts_with("```") {
+            in_code_block = !in_code_block;
+            continue;
+        }
+
+        if in_code_block && !line.trim().is_empty() {
+            let cmd = line.trim().trim_start_matches('$').trim();
+            if !cmd.starts_with('#') {
+                return Some(cmd.to_string());
+            }
+        }
+    }
+
+    for line in &lines {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('#') && !trimmed.starts_with("//") {
+            return Some(trimmed.trim_start_matches('$').trim().to_string());
+        }
+    }
+
+    None
+}
+
+fn is_auto_executable_command(command: &str) -> bool {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    // Placeholders and TODO-like hints indicate incomplete commands.
+    if trimmed.contains('<')
+        || trimmed.contains('>')
+        || trimmed.contains('[')
+        || trimmed.contains(']')
+        || trimmed.contains("...")
+        || trimmed.contains("YOUR_")
+        || trimmed.contains("REPLACE_")
+        || trimmed.contains("{")
+        || trimmed.contains("}")
+    {
+        return false;
+    }
+
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_json_command_suggestion() {
+        let response = r#"{"command":"ls -la","explanation":"list files","auto_execute":true}"#;
+        let parsed = parse_command_suggestion(response);
+
+        assert_eq!(parsed.command.as_deref(), Some("ls -la"));
+        assert_eq!(parsed.explanation.as_deref(), Some("list files"));
+        assert!(parsed.auto_execute);
+    }
+
+    #[test]
+    fn test_parse_markdown_code_block_fallback() {
+        let response = "```bash\nls -la\n```\nList files";
+        let parsed = parse_command_suggestion(response);
+        assert_eq!(parsed.command.as_deref(), Some("ls -la"));
+        assert!(!parsed.auto_execute);
+    }
+
+    #[test]
+    fn test_auto_execute_placeholder_guard() {
+        assert!(!is_auto_executable_command(
+            "kubectl delete deployment <name>"
+        ));
+        assert!(!is_auto_executable_command("echo YOUR_TOKEN"));
+        assert!(is_auto_executable_command("ls -la"));
+    }
 }
 
 /// Execute an explain command

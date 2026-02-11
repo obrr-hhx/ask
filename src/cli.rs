@@ -29,6 +29,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub copy: bool,
 
+    /// Start interactive chat mode (shortcut)
+    #[arg(short = 'c', long = "chat", global = true)]
+    pub chat: bool,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -121,7 +125,12 @@ mod tests {
     fn test_query_string() {
         assert_eq!(get_query_string(&[]), "");
         assert_eq!(
-            get_query_string(&["how".to_string(), "to".to_string(), "list".to_string(), "files".to_string()]),
+            get_query_string(&[
+                "how".to_string(),
+                "to".to_string(),
+                "list".to_string(),
+                "files".to_string()
+            ]),
             "how to list files"
         );
     }

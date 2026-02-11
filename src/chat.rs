@@ -1,8 +1,5 @@
 use anyhow::Result;
-use crossterm::{
-    execute,
-    style::Print,
-};
+use crossterm::{execute, style::Print};
 use std::io::{self, Write};
 
 use crate::client::AIClient;
@@ -42,6 +39,7 @@ impl ChatMode {
         let client = AIClient::new(&self.profile)?;
         let system_prompt =
             SystemPrompt::Chat.get_prompt(&self.system_info, &self.config.behavior.language);
+        let mut history: Vec<(String, String)> = Vec::new();
 
         // Test connection first
         self.renderer.print_info("Connecting to AI provider...")?;
@@ -78,12 +76,18 @@ impl ChatMode {
                     let query = input.trim();
 
                     // Check for exit commands
-                    if query.is_empty() || is_exit_command(query) {
+                    if query.is_empty() {
+                        continue;
+                    }
+                    if is_exit_command(query) {
                         break;
                     }
 
                     // Process the query
-                    if let Err(e) = self.process_query(&client, &system_prompt, query).await {
+                    if let Err(e) = self
+                        .process_query(&client, &system_prompt, &mut history, query)
+                        .await
+                    {
                         self.renderer.print_error(&format!("Error: {}", e))?;
                     }
                 }
@@ -106,13 +110,19 @@ impl ChatMode {
         &self,
         client: &AIClient,
         system_prompt: &str,
+        history: &mut Vec<(String, String)>,
         query: &str,
     ) -> Result<()> {
         // Show thinking indicator
         self.renderer.print_thinking()?;
 
         // Get full response
-        self.get_full_response(client, system_prompt, query).await?;
+        let response = self
+            .get_full_response(client, system_prompt, history, query)
+            .await?;
+
+        history.push(("user".to_string(), query.to_string()));
+        history.push(("assistant".to_string(), response));
 
         println!();
 
@@ -124,10 +134,13 @@ impl ChatMode {
         &self,
         client: &AIClient,
         system_prompt: &str,
+        history: &[(String, String)],
         query: &str,
-    ) -> Result<()> {
+    ) -> Result<String> {
         // Get full response
-        let response = client.chat(system_prompt, query).await?;
+        let response = client
+            .chat_with_history(system_prompt, history, query)
+            .await?;
 
         // Clear the "Thinking..." line
         self.renderer.clear_line()?;
@@ -143,7 +156,7 @@ impl ChatMode {
         // Print the response
         self.renderer.render_markdown(&response)?;
 
-        Ok(())
+        Ok(response)
     }
 }
 

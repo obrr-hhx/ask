@@ -69,7 +69,50 @@ impl AIClient {
 
     /// Send a chat request and return the full response
     pub async fn chat(&self, system_prompt: &str, user_message: &str) -> Result<String> {
-        let request = self.build_request(system_prompt, user_message)?;
+        let messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: system_prompt.to_string(),
+            },
+            Message {
+                role: "user".to_string(),
+                content: user_message.to_string(),
+            },
+        ];
+
+        self.send_messages(messages).await
+    }
+
+    /// Send a chat request with conversation history
+    pub async fn chat_with_history(
+        &self,
+        system_prompt: &str,
+        history: &[(String, String)],
+        user_message: &str,
+    ) -> Result<String> {
+        let mut messages = Vec::with_capacity(history.len() + 2);
+        messages.push(Message {
+            role: "system".to_string(),
+            content: system_prompt.to_string(),
+        });
+
+        for (role, content) in history {
+            messages.push(Message {
+                role: role.clone(),
+                content: content.clone(),
+            });
+        }
+
+        messages.push(Message {
+            role: "user".to_string(),
+            content: user_message.to_string(),
+        });
+
+        self.send_messages(messages).await
+    }
+
+    async fn send_messages(&self, messages: Vec<Message>) -> Result<String> {
+        let request = self.build_request_from_messages(messages)?;
 
         let response = request
             .send()
@@ -99,6 +142,19 @@ impl AIClient {
 
     /// Build the HTTP request for chat completion
     fn build_request(&self, system_prompt: &str, user_message: &str) -> Result<RequestBuilder> {
+        self.build_request_from_messages(vec![
+            Message {
+                role: "system".to_string(),
+                content: system_prompt.to_string(),
+            },
+            Message {
+                role: "user".to_string(),
+                content: user_message.to_string(),
+            },
+        ])
+    }
+
+    fn build_request_from_messages(&self, messages: Vec<Message>) -> Result<RequestBuilder> {
         let mut url = self.profile.base_url.trim_end_matches('/').to_string();
         url.push_str("/chat/completions");
 
@@ -116,16 +172,7 @@ impl AIClient {
 
         let request = ChatRequest {
             model: self.profile.model.clone(),
-            messages: vec![
-                Message {
-                    role: "system".to_string(),
-                    content: system_prompt.to_string(),
-                },
-                Message {
-                    role: "user".to_string(),
-                    content: user_message.to_string(),
-                },
-            ],
+            messages,
             stream: false,
             max_tokens: if self.profile.max_tokens > 0 {
                 Some(self.profile.max_tokens)

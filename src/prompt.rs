@@ -27,21 +27,23 @@ impl SystemPrompt {
 You are a terminal command expert assistant. The user is working on {} with {}.
 
 Rules:
-1. When asked how to do something, respond with the exact command first, then a brief explanation.
-2. Format commands in code blocks with bash language identifier.
-3. If multiple approaches exist, show the most common/portable one first.
-4. Always consider safety - warn about destructive commands.
-5. Be concise. Terminal users value brevity.
-
-Examples:
-User: how to list all files in a directory
-Assistant: ```bash
-ls -la
-```
-
-Lists all files (including hidden) in long format."#,
+1. Respond with JSON only (no markdown, no extra text).
+2. JSON schema:
+   {{
+     "command": "single shell command, or empty string if no runnable command",
+     "explanation": "short explanation",
+     "auto_execute": true or false
+   }}
+3. Set auto_execute=true only when ALL conditions are met:
+   - command is complete and directly runnable
+   - no placeholders like <name>, [optional], YOUR_*, REPLACE_*
+   - low-risk and safe for direct execution
+4. For destructive or context-dependent commands, set auto_execute=false.
+5. Prefer one common, portable command.
+6. Keep explanation concise."#,
             sys_info.format_context(),
-            sys_info.os, sys_info.shell
+            sys_info.os,
+            sys_info.shell
         )
     }
 
@@ -63,7 +65,8 @@ Break down the provided command into parts and explain each component clearly. E
 Use simple language, bullet points, and organize by clear categories.
 If relevant, provide alternatives or simpler variations."#,
             sys_info.format_context(),
-            sys_info.shell, sys_info.os
+            sys_info.shell,
+            sys_info.os
         )
     }
 
@@ -83,7 +86,8 @@ You can help with:
 Be concise and helpful. Provide example commands when relevant.
 You can ask clarifying questions to provide the best assistance."#,
             sys_info.format_context(),
-            sys_info.os, sys_info.shell
+            sys_info.os,
+            sys_info.shell
         )
     }
 
@@ -95,14 +99,14 @@ You can ask clarifying questions to provide the best assistance."#,
 
 Context: {}
 
-Provide the command and brief explanation."#,
+Return strict JSON using the required schema."#,
                 query, ctx
             )
         } else {
             format!(
                 r#"Question: {}
 
-Provide the command and brief explanation."#,
+Return strict JSON using the required schema."#,
                 query
             )
         }
@@ -164,7 +168,7 @@ mod tests {
     fn test_format_command_query() {
         let query = SystemPrompt::format_command_query("how to list files", None);
         assert!(query.contains("how to list files"));
-        assert!(query.contains("Provide the command"));
+        assert!(query.contains("Return strict JSON"));
     }
 
     #[test]

@@ -20,12 +20,9 @@ impl Renderer {
 
     /// Print a command with highlighting
     pub fn print_command(&self, command: &str) -> Result<()> {
-        self.print_header("💡 Command")?;
-
         execute!(
             io::stdout(),
             SetForegroundColor(Color::Green),
-            Print("   "),
             Print(command),
             Print("\n"),
             ResetColor
@@ -36,7 +33,7 @@ impl Renderer {
 
     /// Print an explanation
     pub fn _print_explanation(&self, explanation: &str) -> Result<()> {
-        self.print_header("📝 Explanation")?;
+        self._print_header("📝 Explanation")?;
 
         execute!(
             io::stdout(),
@@ -111,7 +108,7 @@ impl Renderer {
     }
 
     /// Print a section header
-    fn print_header(&self, title: &str) -> Result<()> {
+    fn _print_header(&self, title: &str) -> Result<()> {
         execute!(
             io::stdout(),
             SetForegroundColor(Color::Cyan),
@@ -125,30 +122,26 @@ impl Renderer {
 
     /// Print a thinking/spinner state
     pub fn print_thinking(&self) -> Result<()> {
-        execute!(
-            io::stdout(),
-            SetForegroundColor(Color::Magenta),
-            Print("🤔 Thinking"),
-            ResetColor,
-            Print("..."),
-            Print("\n"),
-        )?;
-
+        // Intentionally silent: user requested no decorative thinking output.
         Ok(())
     }
 
     /// Prompt user to run a command
     pub fn prompt_run_command(&self, command: &str) -> Result<bool> {
+        self.prompt_confirm(&format!("Auto execute `{}`", command))
+    }
+
+    /// Prompt user for a y/N confirmation in blue
+    pub fn prompt_confirm(&self, question: &str) -> Result<bool> {
         if !self.config.behavior.show_run_prompt {
             return Ok(false);
         }
 
         execute!(
             io::stdout(),
-            SetForegroundColor(Color::Cyan),
-            Print("\n🏃 Run `"),
-            Print(command),
-            Print("`? [y/N]: "),
+            SetForegroundColor(Color::Blue),
+            Print(question),
+            Print("? [y/N]: "),
             ResetColor
         )?;
 
@@ -210,7 +203,7 @@ impl Renderer {
                 )?;
             } else if !trimmed.is_empty() {
                 // Regular text
-                println!(" {}", trimmed);
+                println!("{}", trimmed);
             } else {
                 // Empty line
                 println!();

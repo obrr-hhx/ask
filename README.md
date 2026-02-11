@@ -62,9 +62,9 @@ ask --detail 'how to compress a folder'
 # Show only command (brief mode)
 ask --brief 'how to find large files'
 
-# Auto-execute suggested command
+# Auto-execute suggested command (AI decides when safe/useful)
 ask 'how to check disk usage'
-# ...then type 'y' to execute
+# If AI returns auto_execute=true and command is runnable, it executes automatically.
 ```
 
 ### 2. Explain Mode - Understand Commands
@@ -207,7 +207,7 @@ timeout = 30               # Timeout in seconds
 `ask` has built-in security mechanisms to prevent dangerous commands:
 
 - **Automatic Detection**: Identifies dangerous commands like `rm -rf`, `dd`, format commands, etc.
-- **Interactive Confirmation**: Requires user confirmation before execution
+- **Guarded Auto-Execution**: Only auto-runs commands when AI marks them runnable and local checks pass
 - **Clear Warnings**: Displays distinct risk warnings
 - **Educational**: Explains why commands are dangerous
 
