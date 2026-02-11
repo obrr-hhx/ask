@@ -16,6 +16,10 @@ use serde::Deserialize;
 use std::io::Read;
 use tracing::{error, info};
 
+const MAX_PIPED_INPUT_CHARS: usize = 16_000;
+const PIPED_INPUT_HEAD_CHARS: usize = 12_000;
+const PIPED_INPUT_TAIL_CHARS: usize = 4_000;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
@@ -267,8 +271,24 @@ fn read_piped_input() -> Result<Option<String>> {
     if atty::isnt(atty::Stream::Stdin) {
         let mut piped_input = String::new();
         std::io::stdin().read_to_string(&mut piped_input)?;
-        let trimmed = piped_input.trim();
+        let trimmed = piped_input.trim().to_string();
         if !trimmed.is_empty() {
+            if trimmed.chars().count() > MAX_PIPED_INPUT_CHARS {
+                let head: String = trimmed.chars().take(PIPED_INPUT_HEAD_CHARS).collect();
+                let tail: String = trimmed
+                    .chars()
+                    .rev()
+                    .take(PIPED_INPUT_TAIL_CHARS)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
+
+                return Ok(Some(format!(
+                    "Piped input (truncated; showing beginning and end):\n{}\n\n...[truncated]...\n\n{}",
+                    head, tail
+                )));
+            }
             return Ok(Some(format!("Piped input:\n{}", trimmed)));
         }
     }
@@ -434,8 +454,12 @@ async fn execute_explain(
     use crate::render::Renderer;
     use crate::system::SystemInfo;
 
-    let profile = config.get_active_profile()?;
-    let client = AIClient::new(profile)?;
+    let mut profile = config.get_active_profile()?.clone();
+    // Explain with piped context can be much heavier; give it a larger timeout window.
+    if context.is_some() && profile.timeout < 90 {
+        profile.timeout = 90;
+    }
+    let client = AIClient::new(&profile)?;
     let system_info = SystemInfo::detect();
     let renderer = Renderer::new(config.clone());
 
