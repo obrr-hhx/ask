@@ -446,17 +446,23 @@ async fn execute_explain(
     // Format user message
     let user_message = SystemPrompt::format_explain_query(command, context.as_deref());
 
-    // Show thinking indicator
-    renderer.print_thinking()?;
-
-    // Get response
-    let response = client.chat(&system_prompt_text, &user_message).await?;
-
-    // Clear thinking line
-    renderer.clear_line()?;
-
-    // Print explanation
-    renderer.render_markdown(&response)?;
+    let mut stream_state = crate::render::MarkdownStreamState::default();
+    match client
+        .chat_stream(&system_prompt_text, &user_message, |chunk| {
+            renderer.render_markdown_stream_chunk(chunk, &mut stream_state)
+        })
+        .await
+    {
+        Ok(_) => {
+            renderer.finish_markdown_stream(&mut stream_state)?;
+            println!();
+        }
+        Err(_) => {
+            // Fallback for providers that don't support streaming.
+            let response = client.chat(&system_prompt_text, &user_message).await?;
+            renderer.render_markdown(&response)?;
+        }
+    }
 
     Ok(())
 }

@@ -1,6 +1,11 @@
 use anyhow::Result;
 use crossterm::{execute, style::Print};
 use std::io::{self, Write};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use tokio::time::{Duration, sleep};
 
 use crate::client::AIClient;
 use crate::config::{Config, Profile};
@@ -33,8 +38,10 @@ impl ChatMode {
 
     /// Run the interactive chat loop
     pub async fn run(&self) -> Result<()> {
-        self.renderer
-            .print_success("Starting interactive chat mode. Type /exit or press Ctrl+D to quit.")?;
+        self.print_stdout_colored(
+            crossterm::style::Color::Green,
+            "Starting interactive chat mode. Type /exit or press Ctrl+D to quit.",
+        )?;
 
         let client = AIClient::new(&self.profile)?;
         let system_prompt =
@@ -42,12 +49,17 @@ impl ChatMode {
         let mut history: Vec<(String, String)> = Vec::new();
 
         // Test connection first
-        self.renderer.print_info("Connecting to AI provider...")?;
+        self.print_stdout_colored(
+            crossterm::style::Color::Blue,
+            "Connecting to AI provider...",
+        )?;
         match client.test_connection().await {
-            Ok(_) => self.renderer.print_success("Connected!")?,
+            Ok(_) => self.print_stdout_colored(crossterm::style::Color::Green, "Connected!")?,
             Err(e) => {
-                self.renderer
-                    .print_error(&format!("Failed to connect: {}", e))?;
+                self.print_stderr_colored(
+                    crossterm::style::Color::Red,
+                    &format!("Failed to connect: {}", e),
+                )?;
                 return Ok(());
             }
         }
@@ -88,19 +100,21 @@ impl ChatMode {
                         .process_query(&client, &system_prompt, &mut history, query)
                         .await
                     {
-                        self.renderer.print_error(&format!("Error: {}", e))?;
+                        self.print_stderr_colored(crossterm::style::Color::Red, &format!("{}", e))?;
                     }
                 }
                 Err(e) => {
-                    self.renderer
-                        .print_error(&format!("Failed to read input: {}", e))?;
+                    self.print_stderr_colored(
+                        crossterm::style::Color::Red,
+                        &format!("Failed to read input: {}", e),
+                    )?;
                     break;
                 }
             }
         }
 
         println!();
-        self.renderer.print_success("Goodbye!")?;
+        self.print_stdout_colored(crossterm::style::Color::Green, "Goodbye!")?;
 
         Ok(())
     }
@@ -113,12 +127,9 @@ impl ChatMode {
         history: &mut Vec<(String, String)>,
         query: &str,
     ) -> Result<()> {
-        // Show thinking indicator
-        self.renderer.print_thinking()?;
-
-        // Get full response
+        // Stream response
         let response = self
-            .get_full_response(client, system_prompt, history, query)
+            .get_streaming_response(client, system_prompt, history, query)
             .await?;
 
         history.push(("user".to_string(), query.to_string()));
@@ -129,34 +140,148 @@ impl ChatMode {
         Ok(())
     }
 
-    /// Get full response and print at once
-    async fn get_full_response(
+    /// Stream response and render incrementally.
+    async fn get_streaming_response(
         &self,
         client: &AIClient,
         system_prompt: &str,
         history: &[(String, String)],
         query: &str,
     ) -> Result<String> {
-        // Get full response
-        let response = client
-            .chat_with_history(system_prompt, history, query)
-            .await?;
+        let first_chunk = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let mut stream_state = crate::render::MarkdownStreamState::default();
 
-        // Clear the "Thinking..." line
-        self.renderer.clear_line()?;
-
-        // Print AI prefix
+        // Show AI loading indicator immediately.
         execute!(
             io::stdout(),
             crossterm::style::SetForegroundColor(crossterm::style::Color::Cyan),
-            Print("\nAI: "),
-            crossterm::style::ResetColor
+            Print("\nAI"),
+            crossterm::style::ResetColor,
+            Print(": ..."),
         )?;
+        io::stdout().flush()?;
 
-        // Print the response
-        self.renderer.render_markdown(&response)?;
+        // Animate dots until first token arrives.
+        let first_chunk_for_spinner = first_chunk.clone();
+        let done_for_spinner = done.clone();
+        let spinner = tokio::spawn(async move {
+            let frames = [".", "..", "..."];
+            let mut idx = 0usize;
+            loop {
+                if first_chunk_for_spinner.load(Ordering::SeqCst)
+                    || done_for_spinner.load(Ordering::SeqCst)
+                {
+                    break;
+                }
+
+                let dots = frames[idx % frames.len()];
+                let _ = execute!(
+                    io::stdout(),
+                    crossterm::cursor::MoveToColumn(0),
+                    crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine),
+                    crossterm::style::SetForegroundColor(crossterm::style::Color::Cyan),
+                    Print("AI"),
+                    crossterm::style::ResetColor,
+                    Print(format!(": {}", dots)),
+                );
+                let _ = io::stdout().flush();
+                idx += 1;
+                sleep(Duration::from_millis(220)).await;
+            }
+        });
+
+        let first_chunk_for_cb = first_chunk.clone();
+        let response = client
+            .chat_stream_with_history(system_prompt, history, query, |chunk| {
+                if !first_chunk_for_cb.swap(true, Ordering::SeqCst) {
+                    execute!(
+                        io::stdout(),
+                        crossterm::cursor::MoveToColumn(0),
+                        crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine),
+                        crossterm::style::SetForegroundColor(crossterm::style::Color::Cyan),
+                        Print("AI"),
+                        crossterm::style::ResetColor,
+                        Print(": "),
+                    )?;
+                    io::stdout().flush()?;
+                }
+
+                self.renderer
+                    .render_markdown_stream_chunk(chunk, &mut stream_state)
+            })
+            .await;
+
+        done.store(true, Ordering::SeqCst);
+        let _ = spinner.await;
+
+        let response = match response {
+            Ok(resp) => resp,
+            Err(stream_err) => {
+                // If no stream token arrived, fallback to non-stream response.
+                if !first_chunk.load(Ordering::SeqCst) {
+                    execute!(
+                        io::stdout(),
+                        crossterm::cursor::MoveToColumn(0),
+                        crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine),
+                    )?;
+                    execute!(
+                        io::stdout(),
+                        crossterm::style::SetForegroundColor(crossterm::style::Color::Cyan),
+                        Print("AI"),
+                        crossterm::style::ResetColor,
+                        Print(": "),
+                    )?;
+                    io::stdout().flush()?;
+
+                    let fallback = client
+                        .chat_with_history(system_prompt, history, query)
+                        .await?;
+                    self.renderer.render_markdown(&fallback)?;
+                    return Ok(fallback);
+                }
+                return Err(stream_err);
+            }
+        };
+
+        if !first_chunk.load(Ordering::SeqCst) {
+            execute!(
+                io::stdout(),
+                crossterm::cursor::MoveToColumn(0),
+                crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine),
+                crossterm::style::SetForegroundColor(crossterm::style::Color::Cyan),
+                Print("AI"),
+                crossterm::style::ResetColor,
+                Print(": "),
+            )?;
+            io::stdout().flush()?;
+        }
+
+        self.renderer.finish_markdown_stream(&mut stream_state)?;
 
         Ok(response)
+    }
+
+    fn print_stdout_colored(&self, color: crossterm::style::Color, message: &str) -> Result<()> {
+        execute!(
+            io::stdout(),
+            crossterm::style::SetForegroundColor(color),
+            Print(message),
+            Print("\n"),
+            crossterm::style::ResetColor
+        )?;
+        Ok(())
+    }
+
+    fn print_stderr_colored(&self, color: crossterm::style::Color, message: &str) -> Result<()> {
+        execute!(
+            io::stderr(),
+            crossterm::style::SetForegroundColor(color),
+            Print(message),
+            Print("\n"),
+            crossterm::style::ResetColor
+        )?;
+        Ok(())
     }
 }
 

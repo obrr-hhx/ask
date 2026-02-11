@@ -128,8 +128,10 @@ mod tests {
     #[test]
     fn test_warning_messages() {
         assert!(get_dangerous_command_warning("rm -rf /").contains("DELETE EVERYTHING"));
-        assert!(get_dangerous_command_warning("dd if=/dev/zero of=/dev/sda")
-            .contains("overwrite disks"));
+        assert!(
+            get_dangerous_command_warning("dd if=/dev/zero of=/dev/sda")
+                .contains("overwrite disks")
+        );
         assert!(get_dangerous_command_warning("shutdown -h now").contains("shut down"));
     }
 }
